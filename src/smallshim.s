@@ -1,5 +1,3 @@
-; Make it tiny?
-; https://www.muppetlabs.com/~breadbox/software/tiny/teensy.html
 SYS_EXIT     equ  1
 SYS_WRITE    equ  4
 SYS_EXECVE   equ 11
@@ -13,12 +11,83 @@ PATH_MAX     equ 4096
 section .text
 global  _start
 
+; This program runs `ld` with the added command line parameter `--library-path`.
+; Expectations:
+; * Target ld executable is located at "<SHIM_PATH>/../lib/ld-linux-x86-64.so.2"
+; * Target executable (that should be run by ld) is located at "<SHIM_PATH>/../dynbin/<TARGET_FILE>"
+; <SHIM_PATH> is the path to the directory in which this executable (shim executable) is located.
+; <TARGET_FILE> is the filename of this executable (and the filename of the target executable).
+;
+; The expected directory layout is:
+; |-- lib
+; |    `-- ld-linux-x86-64.so.2
+; |-- dynbin
+; |    `-- <TARGET_FILE>
+; `-- bin
+;      `-- <TARGET_FILE>
 _start:
-    ; Read absolute path for this executable.
-    ; readlink('/proc/self/exe', self_path, self_path_len);
-    mov edx, self_path_len ; int bufsiz
-    mov ecx, self_path     ; char* buf
-    mov ebx, abs_path      ; char* path
+    ; Visual explanation how the following code does this.
+    ; Stack right now:
+    ; +------+------+------+---
+    ; | envp | argv | argc |
+    ; +------+------+------+---
+    ;                      ^ esp
+    ;
+    ; With some more detail:
+    ; +----------+------------+-----+----------+----------+------------+-----+----------+------+---
+    ; | &envp[M] | &envp[M-1] | ... | &envp[0] | &argv[N] | &argv[N-1] | ... | &argv[0] | argc |
+    ; +----------+------------+-----+----------+----------+------------+-----+----------+------+---
+    ;                                                                                          ^ esp
+    ;
+    ; Stack just before we call `execve(ld_path, ld_argv, envp)`:
+    ; +------+------+------+---------+----------+---------+---
+    ; | envp | argv | argc | ld_argv | exe_path | ld_path |
+    ; +------+------+------+---------+----------+---------+---
+    ;                      ^ esp                ^ ebp     ^ ebx
+    ;
+    ; ld_argv:
+    ;     Arguments we pass to ld.
+    ;     ld_argv = [&argv[0], "--library-path", "$ORIGIN/../lib", &exe_path, ..argv[1..], NULL]
+    ; exe_path:
+    ;     Path to target executable.
+    ;     We pass a pointer to exe_path to ld (see ld_argv[3]).
+    ;     exe_path = "<SHIM_PATH>/../dynbin/<TARGET_FILE>"
+    ; ld_path:
+    ;     Path to ld.
+    ;     ld_path =  "<SHIM_PATH>/../lib/ld-linux-x86-64.so.2"
+
+    ; ecx = argc
+    mov ecx, [esp]
+
+    ; ebp = &ld_argv[0]
+    mov ebp, esp
+    lea eax, [(ecx+4)*4]
+    sub ebp, eax
+
+    ; Construct ld_argv with which we will call ld.
+    ; ld_argv = [&argv[0], "--library-path", "$ORIGIN/../lib", &exe_path, ..argv[1..], NULL]
+    mov eax, [esp+4] ; &argv[0]
+    mov dword [ebp + 0*4], eax
+    mov dword [ebp + 1*4], ld_arg_1
+    mov dword [ebp + 2*4], ld_arg_2
+    lea eax, [ebp - (PATH_MAX+dynbin_path_len+1)]
+    mov dword [ebp + 3*4], eax ; <-- Placeholder for &exe_path
+    mov dword [esp - 1*4], 0 ; ld_argv[ld_argc] = NULL
+
+    ; Copy argv[1..] into ld_argv[4..].
+    dec ecx              ; length = argc-1
+    lea edi, [ebp + 4*4] ; destination address = &ld_argv[4]
+    lea esi, [esp + 2*4] ; source address = &argv[1]
+    rep movsd ; <-- movs dword!
+
+    ; ebp = &exe_path
+    mov ebp, eax
+
+    ; Read absolute path of this executable.
+    ; readlink('/proc/self/exe', &exe_path, PATH_MAX);
+    mov edx, PATH_MAX ; int   bufsiz
+    mov ecx, ebp      ; char* buf
+    mov ebx, abs_path ; char* path
     mov eax, SYS_READLINK
     int 0x80
 
@@ -26,10 +95,10 @@ _start:
     cmp eax, 0
     jl error
 
-    ; length == self_path_len => Path might have been truncated.
+    ; length == PATH_MAX => Path might have been truncated.
     ; If we want to support longer paths, a future workaround might
     ; be to allocate more bytes and try again.
-    cmp eax, self_path_len
+    cmp eax, PATH_MAX
     je error
 
     ; Find last '/'.
@@ -37,90 +106,51 @@ _start:
     mov edx, eax
 find_slash:
     dec edx
-    cmp byte [self_path+edx], '/'
+    cmp byte [ebp+edx], '/'
     jne find_slash
 
-    ; len(ld_path) > PATH_MAX => error
-    ; ecx = len(ld_path)
-    lea ecx, [edx+ld_file_len]
-    cmp ecx, PATH_MAX
-    jg error
-
-    ; len(exe_path) > PATH_MAX => error
-    ; ecx = len(exe_path)
-    lea ecx, [eax+dynbin_path_len+1]
-    cmp ecx, PATH_MAX
-    jg error
-    ; Add trailing '\0' to create c-string.
-    dec ecx
-    mov byte [exe_path+ecx], 0
+    ; ebx = &ld_path
+    lea ebx, [ebp+eax+dynbin_path_len+1]
 
     ; Create path to our ld (ld_path).
-    ; 1. copy dirname(self_path) to ld_path
-    mov ecx, edx         ; length
-    lea edi, [ld_path]   ; destination address
-    lea esi, [self_path] ; source address
+    ; 1. Copy dirname(self_path) to ld_path.
+    mov ecx, edx                         ; length
+    lea edi, [ebx] ; destination address
+    lea esi, [ebp]                       ; source address
     rep movsb
-    ; 2. copy ld_file to ld_path
-    mov ecx, ld_file_len   ; length
-    lea edi, [ld_path+edx] ; destination address
-    lea esi, [ld_file] ; source address
+    ; 2. Copy ld_file to ld_path.
+    mov ecx, ld_file_len ; length
+    ; destination address (edi) is already at the correct address, after the first copy.
+    lea esi, [ld_file]   ; source address
     rep movsb
+    ; ld_file contains '\0' in its constant.
 
-    ; Create path to dynamic executable (exe_path).
-    ; 1. copy dirname(self_path) to exe_path
-    mov ecx, edx         ; length
-    lea edi, [exe_path]  ; destination address
-    lea esi, [self_path] ; source address
+    ; Create path to the target executable (exe_path).
+    ; We destroy self_path in the process to build exe_path in-place.
+    ; 1. Copy basename(self_path) to exe_path.
+    std ; set direction flag (copy backwards)
+        ; We need to copy backwards, because source and destination might overlap.
+    mov ecx, eax
+    sub ecx, edx         ; length = len(self_path) - len(dirname(self_path))
+    lea edi, [ebx-2]     ; destination address
+    lea esi, [ebp+eax-1] ; source address
     rep movsb
-    ; 2. copy '/../dynbin' to exe_path
+    cld ; clear direction flag
+    ; 2. Add '\0' at the end of exe_path to create a c-string.
+    mov byte [ebx-1], 0
+    ; 3. Copy '/../dynbin' to exe_path.
     mov ecx, dynbin_path_len ; length
-    lea edi, [exe_path+edx]  ; destination address
+    lea edi, [ebp+edx]       ; destination address
     lea esi, [dynbin_path]   ; source address
     rep movsb
-    ; 3. copy basename(self_path) to exe_path
-    mov ecx, eax
-    sub ecx, edx ; length = len(self_path) - len(dirname(self_path))
-    lea edi, [exe_path+edx+dynbin_path_len] ; destination address
-    lea esi, [self_path+edx]                ; source address
-    rep movsb
 
-    mov ecx, [esp]   ; argc
-    mov edx, [esp+4] ; &argv[0]
-
-    ; argc + 4 > ld_argv_len => error
-    ; We add 3 arguments to argv and need space for the trailing NULL.
-    lea eax, [(ecx+4)*4]
-    cmp eax, ld_argv_len
-    jg error
-
-    ; Construct argv with which we call ld.
-    ; ld_argv = [&argv[0], "--library-path", "$ORIGIN/../lib", exe_path, ..argv[1..]]
-    mov [ld_argv], edx
-    mov dword [ld_argv+1*4], ld_arg_1
-    mov dword [ld_argv+2*4], ld_arg_2
-    mov dword [ld_argv+3*4], exe_path
-
-    ; Copy argv[1..] into ld_argv[4..].
-    dec ecx                ; length = argc-1
-    lea edi, [ld_argv+4*4] ; destination address = &ld_argv[4]
-    lea esi, [esp+2*4]     ; source address = &argv[1]
-    rep movsd ; <-- movs dword!
-
-    ; TODO: Remove test print
-    ; write("smallshim works!\n")
-    mov edx, len
-    mov ecx, msg
-    mov ebx, FD_STDOUT
-    mov eax, SYS_WRITE
-    int 0x80
-
-    mov ecx, [esp] ; argc
+    ; edi = argc
+    mov edi, [esp]
 
     ; execve(ld_path, ld_argv, envp)
-    lea edx, [esp + ecx*4 + 2*4] ; char** envp
-    mov ecx, ld_argv             ; char** argv
-    mov ebx, ld_path             ; char*  filename
+    lea edx, [esp + edi*4 + 2*4]                  ; char** envp
+    lea ecx, [ebp + (PATH_MAX+dynbin_path_len+1)] ; char** argv
+    ; lea ebx, [ebx]                              ; char*  filename
     mov eax, SYS_EXECVE
     int 0x80
 
@@ -141,9 +171,8 @@ error:
     inc eax ; <-- mov eax, SYS_EXIT
     int 0x80
 
-;section     .data
 ; Putting strings in the same section makes the binary smaller.
-; https://stackoverflow.com/questions/69862933/decrease-nasm-asembly-executable-size
+; section     .data
 
 ld_file      db  '/../lib/ld-linux-x86-64.so.2',0
 ld_file_len  equ $ - ld_file
@@ -155,28 +184,5 @@ abs_path db '/proc/self/exe',0
 ld_arg_1 db '--library-path',0
 ld_arg_2 db '$ORIGIN/../lib',0
 
-msg     db  'smallshim works!',0xa
-len     equ $ - msg
-
 error_msg      db 'ldshim failed',0xa
 error_msg_len  equ $ - error_msg
-
-
-; Can we define this to not be part of the binary?
-; https://www.nasm.us/doc/nasmdoc8.html#section-8.9.2
-section .data
-
-self_path      times PATH_MAX db 0
-self_path_len  equ $ - self_path
-
-exe_path       times PATH_MAX db 0
-exe_path_len   equ $ - exe_path
-
-ld_path        times PATH_MAX db 0
-ld_path_len    equ $ - exe_path
-
-section .pointers write pointer
-
-; TODO: maybe we should dynamicylly allocate ld_argv
-ld_argv        times 32000 dd 0
-ld_argv_len    equ $ - ld_argv
