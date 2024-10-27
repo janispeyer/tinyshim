@@ -5,11 +5,11 @@ build/smallshim: build/smallshim.o
 
 build/smallshim.o: src/smallshim.s
 	mkdir -p build
-	nasm -f elf src/smallshim.s -o build/smallshim.o
+	nasm -f elf --reproducible src/smallshim.s -o build/smallshim.o
 
 build/tinyshim: src/tinyshim.s
 	mkdir -p build
-	nasm -f bin src/tinyshim.s -o build/tinyshim
+	nasm -f bin --reproducible src/tinyshim.s -o build/tinyshim
 	chmod +x build/tinyshim
 
 clean:

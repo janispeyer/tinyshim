@@ -111,8 +111,8 @@ _start:
     mov dword [ebp + 1*4], ld_arg_1
     mov dword [ebp + 2*4], ld_arg_2
     lea eax, [ebp - (PATH_MAX+dynbin_path_len+1)]
-    mov dword [ebp + 3*4], eax ; <-- Placeholder for &exe_path
-    mov dword [esp - 1*4], 0 ; ld_argv[ld_argc] = NULL
+    mov dword [ebp + 3*4], eax ; ld_argv[3] = &exe_path
+    mov dword [esp - 1*4], 0   ; ld_argv[ld_argc] = NULL
 
     ; Copy argv[1..] into ld_argv[4..].
     dec ecx              ; length = argc-1
