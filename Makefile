@@ -14,3 +14,13 @@ build/tinyshim: src/tinyshim.s
 
 clean:
 	rm -R build
+
+test: all
+	cd testzapp && $(MAKE)
+	cp build/tinyshim testzapp/build/pack/bin/test
+	./testzapp/build/pack/bin/test $(ARGS)
+
+strace: all
+	cd testzapp && $(MAKE)
+	cp build/tinyshim testzapp/build/pack/bin/test
+	strace ./testzapp/build/pack/bin/test $(ARGS)
