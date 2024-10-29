@@ -110,13 +110,15 @@ find_slash:
     jne find_slash
 
     ; ebx = &ld_path
-    lea ebx, [ebp+eax+dynbin_path_len+1]
+    lea ecx, [edx+ld_file_len]
+    mov ebx, ebp
+    sub ebx, ecx
 
     ; Create path to our ld (ld_path).
     ; 1. Copy dirname(self_path) to ld_path.
-    mov ecx, edx                         ; length
+    mov ecx, edx   ; length
     lea edi, [ebx] ; destination address
-    lea esi, [ebp]                       ; source address
+    lea esi, [ebp] ; source address
     rep movsb
     ; 2. Copy ld_file to ld_path.
     mov ecx, ld_file_len ; length
@@ -131,13 +133,13 @@ find_slash:
     std ; set direction flag (copy backwards)
         ; We need to copy backwards, because source and destination might overlap.
     mov ecx, eax
-    sub ecx, edx         ; length = len(self_path) - len(dirname(self_path))
-    lea edi, [ebx-2]     ; destination address
-    lea esi, [ebp+eax-1] ; source address
+    sub ecx, edx                         ; length = len(self_path) - len(dirname(self_path))
+    lea edi, [ebp+eax+dynbin_path_len-1] ; destination address
+    lea esi, [ebp+eax-1]                 ; source address
     rep movsb
     cld ; clear direction flag
     ; 2. Add '\0' at the end of exe_path to create a c-string.
-    mov byte [ebx-1], 0
+    mov byte [ebp+eax+dynbin_path_len], 0
     ; 3. Copy '/../dynbin' to exe_path.
     mov ecx, dynbin_path_len ; length
     lea edi, [ebp+edx]       ; destination address
@@ -186,3 +188,5 @@ ld_arg_2 db '$ORIGIN/../lib',0
 
 error_msg      db 'ldshim failed',0xa
 error_msg_len  equ $ - error_msg
+
+filesize      equ     $ - $$
